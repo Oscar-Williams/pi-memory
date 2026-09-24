@@ -46,18 +46,12 @@ export interface InjectorConfig {
     dimensions?: number;
   };
   /**
-   * Opt-in: restore per-user-message selective injection.
+   * Per-turn retrieval switch. Default (undefined or true): each user turn
+   * runs a relevance search against the current prompt, and `injectionMode`
+   * decides where the block goes.
    *
-   * When false (default), pi-memory injects a one-shot fallback block at
-   * session_start (correct message ordering, stable prefix cache).
-   *
-   * When true, the session_start dump is skipped and each turn runs a
-   * semantic search against the user's current prompt. The injection
-   * strategy is then controlled by `injectionMode`.
-   *
-   * Correctness is preserved either way: systemPrompt is a separate field
-   * from the messages list, so the user's question remains the last
-   * user-role message and the model responds to it.
+   * false: no per-turn retrieval; a one-shot fallback block (all relevant
+   * memory, 8KB cap) is injected as a hidden message at session_start.
    */
   perTurnInjection?: boolean;
   /**

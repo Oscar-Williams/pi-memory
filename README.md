@@ -5,7 +5,7 @@ Persistent memory for [pi](https://github.com/badlogic/pi-mono). Learns correcti
 ## Features
 
 - **Automatic learning** — Extracts preferences, project patterns, and corrections from conversations at session end via LLM consolidation
-- **Context injection** — Automatically adds relevant memory into every new session's system prompt
+- **Context injection** — Retrieves memory relevant to each prompt and injects it just before your message, without touching the system prompt
 - **Corrections stick** — Mistakes you correct once become permanent lessons (e.g. "use sed for daily notes, not echo >>")
 - **Complements session-search** — session-search finds *what you did*, pi-memory remembers *what you learned*
 
@@ -61,9 +61,11 @@ Or add to `~/.pi/agent/settings.json`:
 
 ## How It Works
 
-1. **`session_start`** — Opens the SQLite store, shows memory stats briefly in the status bar, and injects a `<memory>` context block as a hidden custom message (customType `pi-memory-context`, `display: false`) **before** any user message. One-shot per session.
-2. **`agent_end`** — Collects conversation messages for later consolidation
-3. **`session_shutdown`** — Runs LLM consolidation (via `pi -p --print`) to extract structured knowledge, then closes the store
+1. **`session_start`** — Opens the SQLite store and shows memory stats briefly in the status bar.
+2. **`before_agent_start`** — On every user turn, searches memory for entries relevant to the prompt (plus project context for the cwd) and prepares a `<memory>` block.
+3. **`context`** — Splices that block into the request as an ephemeral message just before the latest user message. It is never written to session history.
+4. **`agent_end`** — Collects conversation messages for later consolidation.
+5. **`session_before_switch` / `session_shutdown`** — Runs LLM consolidation (via `pi -p --print`) to extract structured knowledge, then closes the store.
 
 ### Consolidation
 
@@ -77,44 +79,33 @@ Only facts with confidence ≥ 0.8 are stored. Lessons are deduplicated using ex
 
 ### Injection
 
-At session start, stored memory is organized into sections (preferences, project context scoped to cwd, tool preferences, lessons, user identity) and injected **once** as a hidden `<memory>` custom message that sits before the first user message in history. The block is capped at 8KB.
+By default (since 1.5.0), memory is retrieved **per turn** against the current prompt and injected through pi's `context` hook (`injectionMode: "context-hook"`):
 
-The injection happens at `session_start` via `pi.sendMessage`, not per-turn. This is deliberate:
+- The block is inserted as an ephemeral message immediately **before** the latest user message, on every LLM call in the turn (including tool-call continuations), so the user's question stays the last user-role turn.
+- The system prompt is never modified, so its prefix cache always hits. A change in retrieved memory only misses the cache from the injection point forward.
+- The injected block is not persisted to session history and is not fed back into consolidation.
 
-- **Correctness.** A per-turn injection via `before_agent_start` places the memory block *after* the user's question in the message list, so the model ends up responding to the memory block instead of the user. One-shot at the top of history avoids that ordering trap.
-- **Cache stability.** Mutating the system prompt per turn (as earlier versions did) invalidates the provider's prefix cache after the system block (Bedrock / Anthropic `cache_control`), forcing the conversation suffix to be re-written at `cacheWrite` rates on every turn boundary.
-- **Simplicity.** One block, one time, cached for the whole session.
+Retrieval is FTS5 keyword search by default; vector matching is available as an opt-in — see [Semantic search](#semantic-search).
 
-Tradeoff: per-user-message selective injection is off by default — the fallback dump covers preferences, project context for the cwd, tool preferences, lessons, and user identity, which is enough for typical workflows given the 8KB cap. Users with large memory stores who want per-query relevance can opt in (see "Per-turn injection" below).
-
-### Per-turn injection (opt-in)
-
-Set `perTurnInjection: true` to restore v1.0.x per-turn behavior:
+| Setting | Behavior |
+|---------|----------|
+| *(default)* | Per-turn retrieval, `context-hook` injection |
+| `"injectionMode": "system-prompt"` | Per-turn retrieval appended to the system prompt (legacy 1.4.x). A topic shift invalidates the prefix cache from the system prompt onward. |
+| `"perTurnInjection": false` | No per-turn retrieval. One hidden `<memory>` message (customType `pi-memory-context`) is injected once at `session_start` with a fallback dump of preferences, cwd project context, tool preferences, lessons and identity, capped at 8KB. |
 
 ```json
 {
   "memory": {
-    "perTurnInjection": true
+    "injectionMode": "context-hook"
   }
 }
 ```
 
-When enabled:
-
-- The session_start fallback dump is skipped.
-- Each user turn runs FTS relevance search against the current prompt. The default `context-hook` mode inserts the result as ephemeral context immediately before the latest user message; legacy `system-prompt` mode appends it to the system prompt.
-- Vector matching is available again as of v1.6.0 on a maintained backend — see [Semantic search](#semantic-search). It stays off unless configured, so the default is still FTS5 keyword search with no extra dependencies.
-- Pro: facts outside the 8KB fallback dump reach the model when they match the current prompt.
-- Con: the system prompt mutates per turn, invalidating the provider's prefix cache after the system block (Bedrock / Anthropic `cache_control`). The conversation suffix gets re-cached at `cacheWrite` rates on every user-turn boundary (~12.5x `cacheRead` on Claude).
-
-Correctness is preserved either way: `systemPrompt` is a separate field from the messages list, so the user's question remains the last user-role message.
-
-**Lesson filtering in per-turn mode** — When `perTurnInjection: true`, the `lessonInjection` config takes effect:
+**Lesson filtering** — With per-turn retrieval (the default), the `lessonInjection` config takes effect:
 
 ```json
 {
   "memory": {
-    "perTurnInjection": true,
     "lessonInjection": "selective"
   }
 }
@@ -122,14 +113,14 @@ Correctness is preserved either way: `systemPrompt` is a separate field from the
 
 In `selective` lesson mode, lessons are filtered by:
 
-1. **Prompt relevance** — FTS search against the user's first message
+1. **Prompt relevance** — FTS search against the current prompt
 2. **Project context** — lessons matching the current working directory's project
 3. **Category inference** — keywords in the prompt trigger relevant categories (e.g. "pentest" pulls in `bug-bounty` lessons, "blog post" pulls in `writing` lessons)
 4. **General lessons** — always included regardless of prompt
 
 The result is capped at 15 most relevant lessons instead of all of them.
 
-| `lessonInjection` | Behavior (only when `perTurnInjection: true`) |
+| `lessonInjection` | Behavior (per-turn retrieval only) |
 |------|----------|
 | `"all"` (default) | All lessons injected every turn |
 | `"selective"` | Only relevant lessons based on prompt, project, and category |

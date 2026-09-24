@@ -3,6 +3,7 @@ import { Type } from "typebox";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 // src/store.ts
 import { createRequire } from "node:module";
@@ -651,13 +652,23 @@ var DEFAULTS = {
   mistral: { model: "mistral-embed", dimensions: 1024, baseUrl: "https://api.mistral.ai", sendDimensions: false },
   "openai-compatible": { model: "text-embedding-3-small", dimensions: 512, sendDimensions: false }
 };
+var API_KEY_ENV = {
+  openai: "OPENAI_API_KEY",
+  mistral: "MISTRAL_API_KEY"
+};
+function requireApiKey(type, configured) {
+  const envVar = API_KEY_ENV[type];
+  const key = configured || process.env[envVar] || "";
+  if (!key) throw new Error(`${type} embeddings need an API key`);
+  return key;
+}
 function createEmbedder(config) {
   const defaults = DEFAULTS[config.type] ?? {};
   const merged = { ...defaults, ...config };
   switch (merged.type) {
     case "openai":
       return new OpenAICompatibleEmbedder(
-        merged.apiKey || process.env.OPENAI_API_KEY || "",
+        requireApiKey("openai", merged.apiKey),
         merged.model,
         merged.dimensions,
         merged.baseUrl || "https://api.openai.com",
@@ -665,7 +676,7 @@ function createEmbedder(config) {
       );
     case "mistral":
       return new OpenAICompatibleEmbedder(
-        merged.apiKey || process.env.MISTRAL_API_KEY || "",
+        requireApiKey("mistral", merged.apiKey),
         merged.model,
         merged.dimensions,
         merged.baseUrl || "https://api.mistral.ai",
@@ -693,6 +704,97 @@ function createEmbedder(config) {
     default:
       throw new Error(`Unknown embedder type: ${merged.type}`);
   }
+}
+function diagnoseEmbedderError(err, config, packageRoot) {
+  const cfg = { ...DEFAULTS[config.type], ...config };
+  const e = err ?? {};
+  const message = String(e.message ?? err);
+  const firstLine = message.split("\n")[0].slice(0, 200);
+  const code = e.code ?? e.cause?.code;
+  const settings = "the memory.embedding block in settings.json";
+  if (code === "ERR_MODULE_NOT_FOUND" || code === "MODULE_NOT_FOUND" || /Cannot find (package|module)/.test(message)) {
+    if (message.includes("@aws-sdk/")) {
+      return {
+        reason: "the AWS SDK that the bedrock provider needs is not installed (it is an optional dependency, so it was omitted or its install failed)",
+        hint: `Run \`npm install --omit=dev --include=optional\` in ${packageRoot}, or switch memory.embedding.type to openai, mistral, ollama or openai-compatible, which need no SDK.`
+      };
+    }
+    return {
+      reason: `a module it needs is missing (${firstLine})`,
+      hint: "Reinstall the package: `pi install npm:@samfp/pi-memory`."
+    };
+  }
+  const needsKey = /^(\w+) embeddings need an API key$/.exec(message);
+  if (needsKey) {
+    const envVar = API_KEY_ENV[config.type] ?? "the provider's API key variable";
+    return {
+      reason: `no API key is configured for ${needsKey[1]} embeddings`,
+      hint: `Set memory.embedding.apiKey, or export ${envVar} before starting pi.`
+    };
+  }
+  if (config.type === "bedrock") {
+    const where = `profile "${cfg.profile}", region ${cfg.region}`;
+    if (e.name === "CredentialsProviderError" || /could not (resolve|load) credentials/i.test(message)) {
+      return {
+        reason: `no AWS credentials were found for ${where}`,
+        hint: `Configure that profile (for SSO: \`aws sso login --profile ${cfg.profile}\`), or set memory.embedding.profile to one that exists.`
+      };
+    }
+    if (/expired/i.test(`${e.name} ${message}`)) {
+      return {
+        reason: `the AWS credentials for ${where} have expired`,
+        hint: "Refresh them, then run /reload or start a new session."
+      };
+    }
+    if (e.name === "AccessDeniedException" || e.name === "UnrecognizedClientException" || e.$metadata?.httpStatusCode === 403) {
+      return {
+        reason: `Bedrock refused ${cfg.model} for ${where} (${e.name ?? "403"})`,
+        hint: `Check that the profile may call bedrock:InvokeModel and that access to ${cfg.model} is enabled in ${cfg.region}.`
+      };
+    }
+    if (e.name === "ValidationException" || e.name === "ResourceNotFoundException") {
+      return {
+        reason: `Bedrock rejected the request for ${cfg.model} in ${cfg.region}: ${firstLine}`,
+        hint: "Check memory.embedding.model, region and dimensions (Titan v2 accepts 256, 512 or 1024)."
+      };
+    }
+  }
+  const http = /^(?:Embeddings API|Ollama) (\d{3})\b/.exec(message);
+  if (http) {
+    const status = Number(http[1]);
+    if (status === 401 || status === 403) {
+      return {
+        reason: `the embeddings API rejected the API key (HTTP ${status})`,
+        hint: "Check memory.embedding.apiKey (or the provider's API key environment variable)."
+      };
+    }
+    if (status === 404) {
+      return config.type === "ollama" ? {
+        reason: `Ollama has no model named ${cfg.model}`,
+        hint: `Run \`ollama pull ${cfg.model}\`.`
+      } : {
+        reason: `the embeddings endpoint or model was not found (HTTP 404, model ${cfg.model})`,
+        hint: "Check memory.embedding.baseUrl and memory.embedding.model."
+      };
+    }
+    if (status === 429) {
+      return {
+        reason: "the embeddings API is rate limiting requests (HTTP 429)",
+        hint: "This is usually transient; semantic results return once the limit resets."
+      };
+    }
+  }
+  if (code === "ECONNREFUSED" || code === "ENOTFOUND" || /fetch failed/i.test(message)) {
+    const target = config.type === "ollama" ? cfg.url : cfg.baseUrl;
+    return config.type === "ollama" ? {
+      reason: `Ollama is not reachable at ${target}`,
+      hint: `Start it (\`ollama serve\`) and pull the model (\`ollama pull ${cfg.model}\`), or fix memory.embedding.url.`
+    } : {
+      reason: `the embeddings endpoint ${target ?? ""} is not reachable (${code ?? firstLine})`,
+      hint: "Check memory.embedding.baseUrl and your network connection."
+    };
+  }
+  return { reason: firstLine, hint: `Check ${settings}.` };
 }
 function truncate(text, maxChars = 12e3) {
   return text.length > maxChars ? text.slice(0, maxChars) : text;
@@ -767,27 +869,39 @@ var OpenAICompatibleEmbedder = class {
 };
 var BedrockEmbedder = class {
   constructor(profile, region, model, dimensions) {
+    this.profile = profile;
+    this.region = region;
     this.model = model;
     this.dimensions = dimensions;
-    this.clientPromise = (async () => {
+  }
+  profile;
+  region;
+  model;
+  dimensions;
+  client = null;
+  /**
+   * Loaded on first use, not in the constructor. An eager import that fails
+   * (optional AWS SDK absent) while nothing awaits it is an unhandled
+   * rejection, and that crashes pi. The rejection is cached so later calls fail fast.
+   */
+  getClient() {
+    this.client ??= (async () => {
       const { BedrockRuntimeClient } = await import("@aws-sdk/client-bedrock-runtime");
       const { fromIni } = await import("@aws-sdk/credential-providers");
       return new BedrockRuntimeClient({
-        region,
-        credentials: fromIni({ profile })
+        region: this.region,
+        credentials: fromIni({ profile: this.profile })
       });
     })();
+    return this.client;
   }
-  model;
-  dimensions;
-  clientPromise;
   async embed(text, signal) {
     const [result] = await this.embedBatch([text], signal);
     if (!result) throw new Error("Embedding failed");
     return result;
   }
   async embedBatch(texts, signal) {
-    const client = await this.clientPromise;
+    const client = await this.getClient();
     return parallelMap(
       texts,
       async (text) => {
@@ -836,18 +950,22 @@ var OllamaEmbedder = class {
     return json.embeddings[0];
   }
   async embedBatch(texts, signal) {
-    return parallelMap(
+    let firstError;
+    const results = await parallelMap(
       texts,
       async (text) => {
         try {
           return await this.embed(text, signal);
-        } catch {
+        } catch (err) {
+          firstError ??= err;
           return null;
         }
       },
       4,
       signal
     );
+    if (texts.length > 0 && results.every((r) => r === null)) throw firstError;
+    return results;
   }
 };
 
@@ -1073,6 +1191,13 @@ function stripQuotes(v) {
   }
   return v;
 }
+var PACKAGE_ROOT = (() => {
+  try {
+    return resolve(fileURLToPath(new URL("..", import.meta.url)));
+  } catch {
+    return "the pi-memory package directory";
+  }
+})();
 var DEFAULT_MEMORY_DIR = join(homedir(), ".pi", "memory");
 var DEFAULT_DB_PATH = join(DEFAULT_MEMORY_DIR, "memory.db");
 var GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
@@ -1185,6 +1310,24 @@ function index_default(pi) {
   let resolvedDbPath = DEFAULT_DB_PATH;
   let injectorConfig = readSettingsConfig();
   let embedder = null;
+  let embedFailure = null;
+  let notifiedReasons = /* @__PURE__ */ new Set();
+  function reportEmbedFailure(err, ctx = cachedCtx) {
+    const cfg = injectorConfig.embedding;
+    if (!cfg) return;
+    embedFailure = diagnoseEmbedderError(err, cfg, PACKAGE_ROOT);
+    if (notifiedReasons.has(embedFailure.reason)) return;
+    notifiedReasons.add(embedFailure.reason);
+    const text = `pi-memory: semantic search unavailable: ${embedFailure.reason}. ${embedFailure.hint} Keyword search still works.`;
+    try {
+      if (ctx?.hasUI) {
+        ctx.ui.notify(text, "warning");
+        return;
+      }
+    } catch {
+    }
+    console.error(text);
+  }
   function getEmbedder() {
     if (embedder !== null) return embedder || null;
     const cfg = injectorConfig.embedding;
@@ -1196,24 +1339,22 @@ function index_default(pi) {
       embedder = createEmbedder(cfg);
       return embedder;
     } catch (err) {
-      console.error(
-        `pi-memory: embedding provider unavailable (${err?.message ?? err}), using FTS5 only`
-      );
+      reportEmbedFailure(err);
       embedder = false;
       return null;
     }
   }
-  function embedEntry(key, value) {
+  function embedEntry(key, value, ctx) {
     const emb = getEmbedder();
     if (!emb || !store) return;
     const text = `${key.split(".").slice(1).join(" ")} ${value}`.trim();
     emb.embed(text).then((vec) => {
+      embedFailure = null;
       if (vec && vec.length > 0 && store) store.setEmbedding(key.toLowerCase(), Float32Array.from(vec));
-    }).catch(() => {
-    });
+    }).catch((err) => reportEmbedFailure(err, ctx));
   }
   const DEFAULT_EMBED_DIMENSIONS = 512;
-  async function backfillEmbeddings(max = 64, batch = 16) {
+  async function backfillEmbeddings(ctx, max = 64, batch = 16) {
     const emb = getEmbedder();
     if (!emb || !store) return;
     const dims = injectorConfig.embedding?.dimensions ?? DEFAULT_EMBED_DIMENSIONS;
@@ -1224,18 +1365,20 @@ function index_default(pi) {
       const texts = slice.map((e) => `${e.key.split(".").slice(1).join(" ")} ${e.value}`.trim());
       try {
         const vectors = await emb.embedBatch(texts);
+        embedFailure = null;
         vectors.forEach((vec, j) => {
           const entry = slice[j];
           if (vec && vec.length > 0 && entry && store) {
             store.setEmbedding(entry.key.toLowerCase(), Float32Array.from(vec));
           }
         });
-      } catch {
+      } catch (err) {
+        reportEmbedFailure(err, ctx);
         return;
       }
     }
   }
-  async function searchMemory(query, limit) {
+  async function searchMemory(query, limit, ctx) {
     if (!store) return [];
     const pool = Math.max(limit * 2, 20);
     const lexical = store.searchSemantic(query, pool);
@@ -1244,10 +1387,12 @@ function index_default(pi) {
     let semantic = [];
     try {
       const vec = await emb.embed(query);
+      embedFailure = null;
       if (vec && vec.length > 0) {
         semantic = store.searchSemanticByVector(Float32Array.from(vec), pool);
       }
-    } catch {
+    } catch (err) {
+      reportEmbedFailure(err, ctx);
       return lexical.slice(0, limit);
     }
     if (semantic.length === 0) return lexical.slice(0, limit);
@@ -1263,7 +1408,9 @@ function index_default(pi) {
       injectorConfig = readSettingsConfig(sessionCwd);
       store = new MemoryStore(resolvedDbPath);
       embedder = null;
-      void backfillEmbeddings();
+      embedFailure = null;
+      notifiedReasons = /* @__PURE__ */ new Set();
+      void backfillEmbeddings(ctx);
       pendingUserMessages = [];
       pendingAssistantMessages = [];
       try {
@@ -1473,10 +1620,10 @@ ${text}` };
       query: Type.String({ description: "Search query" }),
       limit: Type.Optional(Type.Number({ description: "Max results (default 10)" }))
     }),
-    async execute(_id, params, _signal, _update, _ctx) {
+    async execute(_id, params, _signal, _update, ctx) {
       if (!store) return ok("Memory store not initialized");
       const searchParams = params;
-      const results = await searchMemory(searchParams.query, searchParams.limit ?? 10);
+      const results = await searchMemory(searchParams.query, searchParams.limit ?? 10, ctx);
       if (results.length === 0) {
         return ok("No matching memories found.");
       }
@@ -1498,7 +1645,7 @@ ${text}` };
       category: Type.Optional(Type.String({ description: "Category for lessons (default: general)" })),
       negative: Type.Optional(Type.Boolean({ description: "True if this is something to AVOID" }))
     }),
-    async execute(_id, params, _signal, _update, _ctx) {
+    async execute(_id, params, _signal, _update, ctx) {
       if (!store) return ok("Memory store not initialized");
       const input = params;
       const rememberParams = {
@@ -1517,7 +1664,7 @@ ${text}` };
           return ok("Both key and value required for facts");
         }
         store.setSemantic(rememberParams.key, rememberParams.value, 0.95, "user");
-        embedEntry(rememberParams.key, rememberParams.value);
+        embedEntry(rememberParams.key, rememberParams.value, ctx);
         return ok(`Remembered: ${rememberParams.key} = ${rememberParams.value}`);
       }
       if (rememberParams.type === "lesson") {
@@ -1604,6 +1751,11 @@ ${text}` };
         lines.push(
           `Search: hybrid (FTS5 + ${cfg.type}${cfg.model ? `/${cfg.model}` : ""}), ${cov.embedded}/${cov.total} embedded`
         );
+        if (embedFailure) {
+          lines.push(
+            `Semantic search is failing: ${embedFailure.reason}. ${embedFailure.hint} Results come from keyword search until this is fixed.`
+          );
+        }
       } else {
         lines.push("Search: FTS5 keyword only (set memory.embedding to enable semantic search)");
       }

@@ -22,9 +22,15 @@ import { Type, type TSchema } from "typebox";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { MemoryStore, type SemanticEntry } from "./store.js";
 import { buildContextBlock, projectSlug, type InjectorConfig } from "./injector.js";
-import { createEmbedder, type Embedder } from "./embedder.js";
+import {
+  createEmbedder,
+  diagnoseEmbedderError,
+  type Embedder,
+  type EmbedderDiagnosis,
+} from "./embedder.js";
 import { reciprocalRankFusion } from "./hybrid.js";
 
 // Re-export internals so consumers (e.g. pi-dashboard's system-prompt route)
@@ -76,6 +82,15 @@ import {
   applyExtracted,
   type ConsolidationInput,
 } from "./consolidator.js";
+
+/** Package root: dist/ and src/ both sit one level below it. */
+const PACKAGE_ROOT = (() => {
+  try {
+    return resolve(fileURLToPath(new URL("..", import.meta.url)));
+  } catch {
+    return "the pi-memory package directory";
+  }
+})();
 
 const DEFAULT_MEMORY_DIR = join(homedir(), ".pi", "memory");
 const DEFAULT_DB_PATH = join(DEFAULT_MEMORY_DIR, "memory.db");
@@ -264,6 +279,37 @@ export default function (pi: ExtensionAPI) {
   // "tried and failed" so a broken provider is not retried on every query.
   let embedder: Embedder | null | false = null;
 
+  // Most recent embedding failure (shown by memory_stats), and the reasons the
+  // user has already been told about this session.
+  let embedFailure: EmbedderDiagnosis | null = null;
+  let notifiedReasons = new Set<string>();
+
+  /**
+   * Record an embedding failure and tell the user once per distinct cause.
+   * Search still falls back to FTS5; the point is that semantic search is
+   * never switched off silently (#30).
+   */
+  function reportEmbedFailure(err: unknown, ctx: any = cachedCtx): void {
+    const cfg = injectorConfig.embedding;
+    if (!cfg) return;
+    embedFailure = diagnoseEmbedderError(err, cfg, PACKAGE_ROOT);
+    if (notifiedReasons.has(embedFailure.reason)) return;
+    notifiedReasons.add(embedFailure.reason);
+
+    const text =
+      `pi-memory: semantic search unavailable: ${embedFailure.reason}. ` +
+      `${embedFailure.hint} Keyword search still works.`;
+    try {
+      if (ctx?.hasUI) {
+        ctx.ui.notify(text, "warning");
+        return;
+      }
+    } catch {
+      /* stale ctx: fall through to stderr */
+    }
+    console.error(text);
+  }
+
   function getEmbedder(): Embedder | null {
     if (embedder !== null) return embedder || null;
     const cfg = injectorConfig.embedding;
@@ -275,9 +321,7 @@ export default function (pi: ExtensionAPI) {
       embedder = createEmbedder(cfg);
       return embedder;
     } catch (err) {
-      console.error(
-        `pi-memory: embedding provider unavailable (${(err as Error)?.message ?? err}), using FTS5 only`,
-      );
+      reportEmbedFailure(err);
       embedder = false;
       return null;
     }
@@ -292,15 +336,17 @@ export default function (pi: ExtensionAPI) {
    * a storage convention and embedding it clusters unrelated facts that merely
    * share a prefix.
    */
-  function embedEntry(key: string, value: string): void {
+  function embedEntry(key: string, value: string, ctx?: unknown): void {
     const emb = getEmbedder();
     if (!emb || !store) return;
     const text = `${key.split(".").slice(1).join(" ")} ${value}`.trim();
     emb.embed(text)
       .then((vec) => {
+        embedFailure = null;
         if (vec && vec.length > 0 && store) store.setEmbedding(key.toLowerCase(), Float32Array.from(vec));
       })
-      .catch(() => { /* lexical search still covers this entry */ });
+      // Lexical search still covers this entry; backfill retries next session.
+      .catch((err) => reportEmbedFailure(err, ctx));
   }
 
   /** Titan v2 default; keep in sync with DEFAULTS in ./embedder.ts. */
@@ -317,7 +363,7 @@ export default function (pi: ExtensionAPI) {
    * Batched and capped so a large store does not issue hundreds of provider
    * calls at once; the remainder is picked up on subsequent starts.
    */
-  async function backfillEmbeddings(max: number = 64, batch: number = 16): Promise<void> {
+  async function backfillEmbeddings(ctx?: unknown, max: number = 64, batch: number = 16): Promise<void> {
     const emb = getEmbedder();
     if (!emb || !store) return;
 
@@ -330,13 +376,15 @@ export default function (pi: ExtensionAPI) {
       const texts = slice.map((e) => `${e.key.split(".").slice(1).join(" ")} ${e.value}`.trim());
       try {
         const vectors = await emb.embedBatch(texts);
+        embedFailure = null;
         vectors.forEach((vec, j) => {
           const entry = slice[j];
           if (vec && vec.length > 0 && entry && store) {
             store.setEmbedding(entry.key.toLowerCase(), Float32Array.from(vec));
           }
         });
-      } catch {
+      } catch (err) {
+        reportEmbedFailure(err, ctx);
         return; // provider is unhappy; try again next session
       }
     }
@@ -350,7 +398,7 @@ export default function (pi: ExtensionAPI) {
    * path agrees with it -- truncating to `limit` first would discard exactly
    * the agreements RRF exists to reward.
    */
-  async function searchMemory(query: string, limit: number): Promise<SemanticEntry[]> {
+  async function searchMemory(query: string, limit: number, ctx?: unknown): Promise<SemanticEntry[]> {
     if (!store) return [];
     const pool = Math.max(limit * 2, 20);
     const lexical = store.searchSemantic(query, pool);
@@ -361,11 +409,13 @@ export default function (pi: ExtensionAPI) {
     let semantic: SemanticEntry[] = [];
     try {
       const vec = await emb.embed(query);
+      embedFailure = null;
       if (vec && vec.length > 0) {
         semantic = store.searchSemanticByVector(Float32Array.from(vec), pool);
       }
-    } catch {
-      return lexical.slice(0, limit); // provider hiccup: lexical is still correct
+    } catch (err) {
+      reportEmbedFailure(err, ctx);
+      return lexical.slice(0, limit); // lexical results are still correct
     }
     if (semantic.length === 0) return lexical.slice(0, limit);
 
@@ -395,8 +445,10 @@ export default function (pi: ExtensionAPI) {
 
       // Embedder is per-session; a new session may have different settings.
       embedder = null;
+      embedFailure = null;
+      notifiedReasons = new Set();
       // Deliberately not awaited: startup must not block on a provider call.
-      void backfillEmbeddings();
+      void backfillEmbeddings(ctx);
 
       // Seed pending messages from existing session history so that
       // /memory-consolidate works even when resuming a session (the
@@ -707,11 +759,11 @@ export default function (pi: ExtensionAPI) {
       query: Type.String({ description: "Search query" }),
       limit: Type.Optional(Type.Number({ description: "Max results (default 10)" })),
     }) as any,
-    async execute(_id, params, _signal, _update, _ctx) {
+    async execute(_id, params, _signal, _update, ctx) {
       if (!store) return ok("Memory store not initialized");
 
       const searchParams = params as MemorySearchParams;
-      const results = await searchMemory(searchParams.query, searchParams.limit ?? 10);
+      const results = await searchMemory(searchParams.query, searchParams.limit ?? 10, ctx);
       if (results.length === 0) {
         return ok("No matching memories found.");
       }
@@ -736,7 +788,7 @@ export default function (pi: ExtensionAPI) {
       category: Type.Optional(Type.String({ description: "Category for lessons (default: general)" })),
       negative: Type.Optional(Type.Boolean({ description: "True if this is something to AVOID" })),
     }) as any,
-    async execute(_id, params, _signal, _update, _ctx) {
+    async execute(_id, params, _signal, _update, ctx) {
       if (!store) return ok("Memory store not initialized");
 
       const input = params as MemoryRememberParams;
@@ -759,7 +811,7 @@ export default function (pi: ExtensionAPI) {
           return ok("Both key and value required for facts");
         }
         store.setSemantic(rememberParams.key, rememberParams.value, 0.95, "user");
-        embedEntry(rememberParams.key, rememberParams.value);
+        embedEntry(rememberParams.key, rememberParams.value, ctx);
         return ok(`Remembered: ${rememberParams.key} = ${rememberParams.value}`);
       }
 
@@ -860,6 +912,11 @@ export default function (pi: ExtensionAPI) {
         lines.push(
           `Search: hybrid (FTS5 + ${cfg.type}${cfg.model ? `/${cfg.model}` : ""}), ${cov.embedded}/${cov.total} embedded`,
         );
+        if (embedFailure) {
+          lines.push(
+            `Semantic search is failing: ${embedFailure.reason}. ${embedFailure.hint} Results come from keyword search until this is fixed.`,
+          );
+        }
       } else {
         lines.push("Search: FTS5 keyword only (set memory.embedding to enable semantic search)");
       }

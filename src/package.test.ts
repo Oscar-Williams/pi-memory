@@ -33,3 +33,23 @@ test("does not install a duplicate Pi host in consumers", async () => {
     true,
   );
 });
+
+test("runtime dependency tree needs no install scripts (#30)", async () => {
+  // Installers that block lifecycle scripts (pi's own, `--ignore-scripts`,
+  // pnpm's allow-list) once left the native `sharp` binding unbuilt and
+  // silently disabled semantic search. Keep the runtime tree script-free.
+  const lock = JSON.parse(
+    await readFile(new URL("../package-lock.json", import.meta.url), "utf8"),
+  ) as { packages: Record<string, { dev?: boolean; hasInstallScript?: boolean }> };
+
+  const runtime = Object.entries(lock.packages).filter(([path, meta]) => path && !meta.dev);
+  assert.ok(runtime.length > 0, "lockfile lists runtime packages");
+  assert.deepEqual(
+    runtime.filter(([, meta]) => meta.hasInstallScript).map(([path]) => path),
+    [],
+  );
+  assert.deepEqual(
+    runtime.map(([path]) => path).filter((p) => /\/(sharp|@xenova|onnxruntime[^/]*)$/.test(p)),
+    [],
+  );
+});

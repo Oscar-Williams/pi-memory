@@ -179,14 +179,16 @@ Bedrock provider is simply unavailable and search stays lexical.
 Behaviour worth knowing:
 
 - **Fully optional and fail-soft.** An unconfigured, misconfigured, or failing
-  provider logs once and falls back to FTS5. Search never errors out.
+  provider falls back to FTS5, and search never errors out. The first failure
+  of each kind in a session shows a warning naming the cause and the fix (see
+  [Troubleshooting](#troubleshooting-semantic-search)).
 - **Embeddings are written lazily.** New facts are embedded as they are stored;
   existing ones are backfilled in bounded batches shortly after `session_start`.
   Backfill runs there rather than at write time because the main writer is
   session-end consolidation, and a promise started during shutdown is killed
   before it resolves.
-- **Stale-width vectors are replaced automatically.** Stores written before
-  v1.5.0 hold 384-dim MiniLM vectors; a 512-dim config makes those unmatchable,
+- **Stale-width vectors are replaced automatically.** Stores written by v1.5.0
+  and earlier hold 384-dim MiniLM vectors; a 512-dim config makes those unmatchable,
   since cosine similarity of different-length vectors is treated as 0. Backfill
   detects the width mismatch and re-embeds, so you do not need to clear the
   column.
@@ -195,6 +197,30 @@ Behaviour worth knowing:
 
 To turn it off, remove the `embedding` block. Stored vectors are left alone and
 become inert.
+
+### Troubleshooting semantic search
+
+Run `memory_stats` (ask the agent to, or call the tool). With a provider
+configured it prints `Search: hybrid (...)` and, if embedding is failing,
+a `Semantic search is failing: <cause>. <fix>` line. The same message appears
+once per session as a warning. Keyword search keeps working throughout.
+
+| Cause | Fix |
+|---|---|
+| **AWS SDK not installed** (bedrock). The SDK packages are `optionalDependencies`, so `--omit=optional`, `--no-optional`, an `omit=optional` npm config, or a failed optional install leaves them out. | Run `npm install --omit=dev --include=optional` in the pi-memory package directory (the warning prints the path), or use a provider that needs no SDK: `openai`, `mistral`, `ollama`, `openai-compatible`. |
+| **No AWS credentials / expired / access denied** (bedrock) | Check `memory.embedding.profile` and `region`, refresh the profile's credentials (for SSO: `aws sso login --profile <name>`), and make sure the model is enabled for `bedrock:InvokeModel` in that region. |
+| **No API key** (openai, mistral) | Set `memory.embedding.apiKey`, or export `OPENAI_API_KEY` / `MISTRAL_API_KEY` before starting pi. |
+| **Ollama not reachable / model missing** | `ollama serve`, then `ollama pull <model>` (default `nomic-embed-text`). Check `memory.embedding.url`. |
+
+**Blocked install scripts are no longer a factor.** Up to v1.5.0, semantic
+search ran on `@xenova/transformers`, whose native `sharp` binding is built by
+an install script. Installers that skip lifecycle scripts left it unbuilt, and
+search silently fell back to keywords with a misleading
+`@xenova/transformers not installed` message ([#30](https://github.com/samfoy/pi-memory/issues/30)).
+That backend is gone. The current providers are plain HTTP or AWS SDK calls,
+and nothing in the runtime dependency tree needs an install script, which a
+test enforces. If you still see the `@xenova/transformers` message, you are
+on an old version: upgrade with `pi update npm:@samfp/pi-memory` (or `pi update --extensions`).
 
 ## Storage
 

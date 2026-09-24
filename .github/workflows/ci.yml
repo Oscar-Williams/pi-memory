@@ -2,19 +2,27 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
-  test:
+  verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
-          cache: npm
+      # Lockfiles generated behind a local proxy or CodeArtifact leak unreachable URLs.
+      - name: Lockfile resolves only from registry.npmjs.org
+        run: "! grep -E '\"resolved\": \"' package-lock.json | grep -v 'https://registry.npmjs.org/'"
       - run: npm ci
-      - run: npm run test
       - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Committed dist is up to date
+        run: git diff --exit-code dist
+      - run: npm pack --dry-run

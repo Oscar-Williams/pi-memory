@@ -8,7 +8,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import piMemory from "./index.js";
+// pi-memory reads ~/.pi/agent/settings.json; point HOME at an empty dir so a
+// developer's real config (e.g. a live embedding provider) cannot leak in.
+// node --test runs each file in its own process, so this stays local.
+const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-home-"));
+process.env.HOME = fakeHome;
+process.env.USERPROFILE = fakeHome;
+const { default: piMemory } = await import("./index.js");
 
 type Api = Parameters<typeof piMemory>[0];
 type Handler = (event: unknown, ctx: unknown) => unknown;
@@ -25,12 +31,18 @@ function createHarness(memorySettings: Record<string, unknown>) {
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, Tool>();
   const notifications: { text: string; level?: string }[] = [];
+  const statuses: string[] = [];
+  const sent: { customType?: string; content?: string }[] = [];
+  const execCalls: unknown[][] = [];
   const pi = {
     on: (name: string, h: Handler) => void handlers.set(name, h),
     registerTool: (t: Tool & { name: string }) => void tools.set(t.name, t),
     registerCommand() {},
-    sendMessage() {},
-    exec: async () => ({ code: 0, stdout: '{"semantic":[],"lessons":[]}' }),
+    sendMessage: (m: { customType?: string; content?: string }) => void sent.push(m),
+    exec: async (...args: unknown[]) => {
+      execCalls.push(args);
+      return { code: 0, stdout: '{"semantic":[],"lessons":[]}' };
+    },
   };
   piMemory(pi as unknown as Api);
 
@@ -38,7 +50,7 @@ function createHarness(memorySettings: Record<string, unknown>) {
     cwd: project,
     hasUI: true,
     ui: {
-      setStatus() {},
+      setStatus: (_key: string, value: string) => void statuses.push(value),
       notify: (text: string, level?: string) => void notifications.push({ text, level }),
     },
     sessionManager: { getBranch: () => [], getEntries: () => [] },
@@ -51,6 +63,9 @@ function createHarness(memorySettings: Record<string, unknown>) {
     ctx,
     handlers,
     notifications,
+    statuses,
+    sent,
+    execCalls,
     call,
     async cleanup() {
       await handlers.get("session_shutdown")?.({}, ctx);
@@ -106,6 +121,123 @@ describe("embedding failures are surfaced, not silent (#30)", () => {
       assert.equal(h.notifications.length, 1);
       assert.match(h.notifications[0]!.text, /Ollama is not reachable at http:\/\/127\.0\.0\.1:9/);
       assert.match(h.notifications[0]!.text, /ollama serve/);
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+describe("per-turn injection through the hooks", () => {
+  const conversation = [
+    { role: "user", content: "earlier question" },
+    { role: "assistant", content: [{ type: "text", text: "earlier answer" }] },
+    { role: "user", content: "which editor do I use?" },
+    { role: "assistant", content: [{ type: "toolCall", id: "t1", name: "read", arguments: {} }] },
+    { role: "toolResult", toolCallId: "t1", content: [{ type: "text", text: "file" }] },
+  ];
+
+  async function seeded(memorySettings: Record<string, unknown>) {
+    const h = createHarness(memorySettings);
+    await h.handlers.get("session_start")!({}, h.ctx);
+    await h.call("memory_remember", { type: "fact", key: "pref.editor", value: "neovim editor with lazy.nvim" });
+    return h;
+  }
+
+  it("context-hook (default): leaves the system prompt alone and splices memory before the latest user turn", async () => {
+    const h = await seeded({});
+    try {
+      const start = await h.handlers.get("before_agent_start")!(
+        { prompt: "which editor do I use?", systemPrompt: "SYS" },
+        h.ctx,
+      );
+      assert.equal(start, undefined, "system prompt must not be modified");
+
+      const messages = conversation.map((m) => ({ ...m }));
+      // Called on every LLM call in the turn, including tool-call continuations.
+      for (let call = 0; call < 2; call++) {
+        const out = (await h.handlers.get("context")!({ messages }, h.ctx)) as { messages: any[] };
+        assert.equal(out.messages.length, conversation.length + 1);
+        assert.equal(out.messages[2].role, "user");
+        assert.match(out.messages[2].content, /^<memory>/);
+        assert.match(out.messages[2].content, /editor: neovim editor with lazy\.nvim/);
+        assert.equal(out.messages[3].content, "which editor do I use?", "user question stays the last user turn");
+        assert.equal(out.messages.at(-1).role, "toolResult");
+      }
+      assert.equal(messages.length, conversation.length, "event.messages is not mutated");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("context-hook: injects nothing when no memory matches", async () => {
+    const h = createHarness({});
+    try {
+      await h.handlers.get("session_start")!({}, h.ctx);
+      await h.handlers.get("before_agent_start")!({ prompt: "unrelated", systemPrompt: "SYS" }, h.ctx);
+      assert.equal(await h.handlers.get("context")!({ messages: conversation }, h.ctx), undefined);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("system-prompt mode appends to the system prompt and skips the context hook", async () => {
+    const h = await seeded({ injectionMode: "system-prompt" });
+    try {
+      const start = (await h.handlers.get("before_agent_start")!(
+        { prompt: "which editor do I use?", systemPrompt: "SYS" },
+        h.ctx,
+      )) as { systemPrompt: string };
+      assert.match(start.systemPrompt, /^SYS\n\n<memory>/);
+      assert.match(start.systemPrompt, /editor: neovim editor with lazy\.nvim/);
+      assert.equal(await h.handlers.get("context")!({ messages: conversation }, h.ctx), undefined);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("perTurnInjection: false injects once at session_start instead", async (t) => {
+    // session_start with a non-empty store arms a 5s status-clear timer.
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = createHarness({ perTurnInjection: false });
+    try {
+      await h.handlers.get("session_start")!({}, h.ctx);
+      await h.call("memory_remember", { type: "fact", key: "pref.editor", value: "neovim editor" });
+      // A later session over the same store gets the one-shot dump.
+      await h.handlers.get("session_start")!({}, h.ctx);
+      assert.equal(h.sent.filter((m) => m.customType === "pi-memory-context").length, 1);
+      assert.equal(
+        await h.handlers.get("before_agent_start")!({ prompt: "editor", systemPrompt: "SYS" }, h.ctx),
+        undefined,
+      );
+      assert.equal(await h.handlers.get("context")!({ messages: conversation }, h.ctx), undefined);
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+describe("consolidation status", () => {
+  it("session_before_switch consolidates and always clears the status", async () => {
+    const h = createHarness({ consolidationModel: "test/model" });
+    try {
+      await h.handlers.get("session_start")!({}, h.ctx);
+      await h.handlers.get("agent_end")!(
+        {
+          messages: ["one", "two", "three"].flatMap((n) => [
+            { role: "user", content: `remember preference ${n}` },
+            { role: "assistant", content: "ok" },
+          ]),
+        },
+        h.ctx,
+      );
+      await h.handlers.get("session_before_switch")!({}, h.ctx);
+      assert.deepEqual(h.statuses.slice(-2), ["🧠 Consolidating memory...", ""]);
+      assert.equal(h.execCalls.length, 1);
+      assert.ok((h.execCalls[0]![1] as string[]).includes("test/model"));
+
+      // Queue was reset, so shutdown has nothing left to consolidate.
+      await h.handlers.get("session_shutdown")!({}, h.ctx);
+      assert.equal(h.execCalls.length, 1);
     } finally {
       await h.cleanup();
     }

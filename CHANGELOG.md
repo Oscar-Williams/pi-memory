@@ -2,7 +2,7 @@
 
 All notable changes to `@samfp/pi-memory`. Versions follow [semver](https://semver.org/).
 
-## [Unreleased]
+## [1.6.1] - 2026-10-09
 
 ### Fixed
 

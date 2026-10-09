@@ -44,6 +44,26 @@ describe("diagnoseEmbedderError (#30)", () => {
     assert.match(dflt.reason, /profile "default", region us-east-1/);
   });
 
+  it("reports a failing credential_process with its own stderr, not as a missing profile", () => {
+    // Message shape from @aws-sdk/credential-provider-process when the command exits non-zero.
+    const err = named(
+      "CredentialsProviderError",
+      "Command failed: /opt/bin/vend creds\nfetching role...\nunable to authenticate; please run 'login-tool'\n",
+    );
+    const d = diagnoseEmbedderError(err, { type: "bedrock", profile: "work", region: "eu-west-1" }, ROOT);
+    assert.match(d.reason, /credential_process for profile "work", region eu-west-1 failed/);
+    assert.match(d.reason, /please run 'login-tool'/);
+    assert.doesNotMatch(d.reason, /no AWS credentials|\/opt\/bin\/vend/);
+    assert.doesNotMatch(d.hint, /aws sso login/);
+    assert.match(d.hint, /aws sts get-caller-identity --profile work/);
+
+    const badJson = named("CredentialsProviderError", "Profile work credential_process returned invalid JSON.");
+    assert.match(
+      diagnoseEmbedderError(badJson, { type: "bedrock", profile: "work" }, ROOT).reason,
+      /credential_process .* failed \(Profile work credential_process returned invalid JSON\.\)/,
+    );
+  });
+
   it("reports expired credentials", () => {
     const err = named("ExpiredTokenException", "The security token included in the request is expired");
     assert.match(diagnoseEmbedderError(err, { type: "bedrock" }, ROOT).reason, /expired/);

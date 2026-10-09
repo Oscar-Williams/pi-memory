@@ -177,6 +177,18 @@ export function diagnoseEmbedderError(
 
   if (config.type === "bedrock") {
     const where = `profile "${cfg.profile}", region ${cfg.region}`;
+    // The profile exists but its command failed, e.g. an expired login session behind it.
+    // "Command failed: <cmd>\n<stderr>": show the last stderr line, where the tool's own advice usually is.
+    if (e.name === "CredentialsProviderError" && /^Command failed:|credential_process (returned|did not return)/.test(message)) {
+      const stderr = message.split("\n").slice(1).map((l) => l.trim()).filter(Boolean);
+      const detail = message.startsWith("Command failed:") ? (stderr.at(-1) ?? "no error output") : firstLine;
+      return {
+        reason: `the credential_process for ${where} failed (${detail.slice(0, 300)})`,
+        hint:
+          `Run \`aws sts get-caller-identity --profile ${cfg.profile}\` to see the full error. ` +
+          "If the process relies on a login session, renew it, then run /reload or start a new session.",
+      };
+    }
     if (e.name === "CredentialsProviderError" || /could not (resolve|load) credentials/i.test(message)) {
       return {
         reason: `no AWS credentials were found for ${where}`,

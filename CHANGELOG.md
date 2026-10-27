@@ -2,6 +2,16 @@
 
 All notable changes to `@samfp/pi-memory`. Versions follow [semver](https://semver.org/).
 
+## [1.6.1] - 2026-10-09
+
+### Fixed
+
+- **A failing `credential_process` is no longer reported as a missing profile.**
+  When a Bedrock profile exists but its `credential_process` exits non-zero
+  (typically an expired login session behind it), the startup warning now says
+  the process failed and quotes its last stderr line, instead of "no AWS
+  credentials were found" with an `aws sso login` hint that did not apply.
+
 ## [1.6.0] - 2026-09-24
 
 First npm release since 1.5.0. The 1.5.0 tarball on npm was built before the
